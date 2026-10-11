@@ -39,35 +39,84 @@ class Executor:
         except (KeyError, FileNotFoundError, subprocess.TimeoutExpired) as e:
             return{"ok": False, "error": str(e)}
         
-ex = Executor(".")
-print(ex.execute("run", {"argv": ["python", "-c", "print('hi')"]}))
-# 期望：ok True, exit_code 0, stdout 'hi\r\n'
+class Agent:
+    def __init__(self, model, executor, max_steps=10):
+        # 三个参数存到 self 上
+        self.model, self.executor, self.max_steps = model, executor, max_steps
 
-r = ex.execute("run", {"argv": ["python", "-c", "import sys; sys.exit(3)"]})
-print(r["ok"], r["exit_code"])
-# 期望：False 3
+    def run(self, task):
+        messages = [
+            {"role": "system", "content": "你是一个软件工程 Agent，每次只输出一个 JSON 动作。"},
+            {"role": "user", "content": task}
+                    ]                      # 两条初始消息
+        steps = 0
+        while steps < self.max_steps:
+            steps += 1
+            raw = self.model.complete(messages)                         # 问模型
+            messages.append({"role": "assistant", "content": raw})              # 记下模型的回复
+            try:
+                action = parse_action(raw)                  # 解析
+                if action["type"] == "done":                       # 是 done 吗？
+                    return {"status": "finished", "steps": steps, "summary": action["summary"]}
+                print(f"[{steps}]{action["name"]}")                 # 打印 [步数] 工具名
+                observation = self.executor.execute(action["name"], action["args"])             # 执行工具
+            except ValueError as e:
+                observation = {"ok": False, "error": "格式错误：" + str(e)}
+            messages.append({"role": "user", "content": json.dumps(observation, ensure_ascii=False)})              # 把结果告诉模型
+        return {"status": "step_limit", "steps": steps}                          # 步数用完
 
-print(ex.execute("run", {"argv": ["python", "-c", "import time; time.sleep(40)"]}))
-# 期望：等 30 秒后，ok False，不崩溃
 
-print(ex.execute("run", {"argv": ["不存在的命令"]}))
-# 期望：ok False，不崩溃（猜猜是哪个错误接住的？）
+if __name__ == "__main__":
+    print(parse_action('{"type":"done","summary":"ok"}'))
+    print(parse_action('{"type":"tool","name":"read_file","args":{"path":"a.py"}}'))
+    for bad in ['hello', '[1,2]', '{"type":"tool","name":"x"}', '{"type":"done"}']:
+        try:
+            parse_action(bad)
+            print("❌ 应该报错但没报：", bad)
+        except ValueError as e:
+            print("✅ 正确拒绝：", bad, "→", type(e).__name__, e)
+    ex = Executor(".")
+    print(ex.execute("read_file", {"path": "agent_by_hand.py"})["ok"])   # True
+    print(ex.execute("read_file", {"path": "不存在.py"}))                # ok: False
+    print(ex.execute("fly", {}))                                        # 未知工具
+    print(ex.execute("read_file", {}))    
+    ex = Executor(".")
+    print(ex.execute("run", {"argv": ["python", "-c", "print('hi')"]}))
+    # 期望：ok True, exit_code 0, stdout 'hi\r\n'
 
-print(ex.execute("read_file", {"path": "agent_by_hand.py"})["ok"])
-# 期望：True（确认旧功能没被改坏） 
+    r = ex.execute("run", {"argv": ["python", "-c", "import sys; sys.exit(3)"]})
+    print(r["ok"], r["exit_code"])
+    # 期望：False 3
 
+    print(ex.execute("run", {"argv": ["python", "-c", "import time; time.sleep(40)"]}))
+    # 期望：等 30 秒后，ok False，不崩溃
 
-# if __name__ == "__main__":
-#     print(parse_action('{"type":"done","summary":"ok"}'))
-#     print(parse_action('{"type":"tool","name":"read_file","args":{"path":"a.py"}}'))
-#     for bad in ['hello', '[1,2]', '{"type":"tool","name":"x"}', '{"type":"done"}']:
-#         try:
-#             parse_action(bad)
-#             print("❌ 应该报错但没报：", bad)
-#         except ValueError as e:
-#             print("✅ 正确拒绝：", bad, "→", type(e).__name__, e)
-#     ex = Executor(".")
-#     print(ex.execute("read_file", {"path": "agent_by_hand.py"})["ok"])   # True
-#     print(ex.execute("read_file", {"path": "不存在.py"}))                # ok: False
-#     print(ex.execute("fly", {}))                                        # 未知工具
-#     print(ex.execute("read_file", {}))    
+    print(ex.execute("run", {"argv": ["不存在的命令"]}))
+    # 期望：ok False，不崩溃（猜猜是哪个错误接住的？）
+
+    print(ex.execute("read_file", {"path": "agent_by_hand.py"})["ok"])
+    # 期望：True（确认旧功能没被改坏） 
+
+    class FakeModel:
+        def __init__(self, replies):
+            self.replies = iter(replies)
+        def complete(self, messages):
+            return next(self.replies)
+
+        # 测试 1：正常流程，读文件 → 格式错误 → done
+    model = FakeModel([
+        '{"type":"tool","name":"read_file","args":{"path":"agent_by_hand.py"}}',
+        '我想想……',
+        '{"type":"done","summary":"读完了"}',
+    ])
+    agent = Agent(model, Executor("."))
+    print(agent.run("读一下 agent_by_hand.py"))
+    # 期望：打印 [1] read_file
+    #       然后 {'status': 'finished', 'steps': 3, 'summary': '读完了'}
+
+    # 测试 2：模型一直不说 done，步数上限起作用
+    model = FakeModel(['{"type":"tool","name":"fly","args":{}}'] * 5)
+    agent = Agent(model, Executor("."), max_steps=2)
+    print(agent.run("测试步数上限"))
+    # 期望：打印 [1] fly 和 [2] fly
+    #       然后 {'status': 'step_limit', 'steps': 2}
